@@ -1,0 +1,380 @@
+import asyncio
+import datetime
+import json
+import re
+import socket
+import ssl
+
+import aiohttp
+from curl_cffi import requests as curl_requests
+
+import astrbot.api.message_components as Comp
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
+
+COZE_IP = "113.57.56.233"
+COZE_HOST = "api.coze.cn"
+COZE_BASE_URL = f"https://{COZE_IP}"
+
+
+@register("astrbot_plugin_kebiao", "YourName", "课表图片生成与入库插件", "1.0.46")
+class KebeiaoPlugin(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self.coze_api_url = f"{COZE_BASE_URL}/v1/workflow/run"
+        self.coze_api_key = (
+            "pat_NYaZEtnoKDy34OPZoDmms6TqxX4GIbE3WxpnmJKF5hdg8qfnlUIahXoOEa5Pf3WR"
+        )
+        self.coze_workflow_id = "7630329686618832934"  # photo_kebiao
+        self.upload_workflow_id = "7630043697174544399"  # kebiao
+        self.file_upload_url = f"{COZE_BASE_URL}/v1/files/upload"
+        self.processing_users = set()
+        self.semester_start = datetime.date(2026, 3, 2)
+
+    @filter.on_decorating_result()
+    async def suppress_coze_errors(self, event: AstrMessageEvent):
+        result = event.get_result()
+        if result and result.chain:
+            for comp in result.chain:
+                if isinstance(comp, Comp.Plain) and "Coze 请求失败" in comp.text:
+                    logger.info("【课表插件】已拦截 Coze 错误消息，已阻止发送给用户")
+                    result.chain.clear()
+                    event.stop_event()
+                    return
+
+    def _get_ssl_context(self):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def _get_client_session(self, host: str = None):
+        connector = aiohttp.TCPConnector(
+            ssl=self._get_ssl_context(),
+            force_close=True,
+            ttl_dns_cache=300,
+            family=socket.AF_INET,
+        )
+        headers = {"Host": host} if host else {}
+        return aiohttp.ClientSession(connector=connector, headers=headers)
+
+    def _get_current_week(self):
+        """计算当前教学周"""
+        today = datetime.date.today()
+        delta = today - self.semester_start
+        return max(1, delta.days // 7 + 1)
+
+    # ========== 自然语言课表拦截（最重要） ==========
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    async def on_message(self, event: AstrMessageEvent):
+        """拦截自然语言课表请求，自动计算周次并发送图片"""
+        text = event.get_message_str().strip()
+        if not text:
+            return
+
+        week_number = None
+        if re.search(r"本周|这周|这星期", text):
+            week_number = self._get_current_week()
+        elif re.search(r"下周|下星期", text):
+            week_number = self._get_current_week() + 1
+        elif re.search(r"上周|上星期", text):
+            week_number = max(1, self._get_current_week() - 1)
+        elif re.search(r"第\s*(\d+)\s*周", text):
+            match = re.search(r"第\s*(\d+)\s*周", text)
+            week_number = int(match.group(1))
+
+        if week_number is not None:
+            event.stop_event()
+            user_id = event.get_sender_id()
+            logger.info(f"【课表插件】自然语言请求：{text} → 第{week_number}周")
+            try:
+                image_url = await self.call_coze_workflow(str(week_number), user_id)
+                if image_url:
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: curl_requests.get(
+                            image_url, impersonate="chrome120", timeout=15
+                        ),
+                    )
+                    if response.status_code == 200:
+                        img_bytes = response.content
+                        chain = [
+                            Comp.Plain(f"📸 第{week_number}周课表"),
+                            Comp.Image.fromBytes(img_bytes),
+                        ]
+                        yield event.chain_result(chain)
+                        return
+                    else:
+                        yield event.plain_result(
+                            f"❌ 图片下载失败，HTTP {response.status_code}"
+                        )
+                        return
+                else:
+                    yield event.plain_result("❌ 课表生成失败，请稍后重试。")
+                    return
+            except Exception as e:
+                logger.error(f"自然语言发送图片失败: {e}")
+                yield event.plain_result(f"❌ 发生错误：{str(e)}")
+                return
+
+        return
+
+    # ========== 文件监听与入库 ==========
+    @filter.command("", message_type="file")
+    async def on_file_received(self, event: AstrMessageEvent):
+        logger.info("【课表插件】文件监听器被触发！")
+        msg = event.message_obj
+
+        if not hasattr(msg, "message"):
+            logger.debug("【课表插件】非消息事件，已忽略")
+            return
+
+        file_info = None
+        for comp in msg.message:
+            if hasattr(comp, "type") and comp.type == "file":
+                file_info = comp.data if hasattr(comp, "data") else {}
+                break
+            if (
+                hasattr(comp, "data")
+                and isinstance(comp.data, dict)
+                and "file_id" in comp.data
+            ):
+                file_info = comp.data
+                break
+            if "File" in type(comp).__name__:
+                if hasattr(comp, "data"):
+                    file_info = comp.data
+                elif hasattr(comp, "url"):
+                    file_info = {
+                        "url": comp.url,
+                        "file": getattr(comp, "name", "unknown"),
+                    }
+                break
+
+        if not file_info:
+            logger.debug("【课表插件】未找到文件组件，已忽略")
+            return
+
+        user_id = event.get_sender_id()
+        if user_id in self.processing_users:
+            yield event.plain_result("⏳ 正在处理上一个文件，请稍候...")
+            return
+
+        self.processing_users.add(user_id)
+        filename = (
+            file_info.get("file") or file_info.get("file_name") or "schedule.xlsx"
+        )
+        logger.info(f"【课表插件】开始处理用户 {user_id} 的文件: {filename}")
+
+        yield event.plain_result("📎 文件已收到，正在解析并录入课表，请稍候...")
+
+        try:
+            result = await self._process_file_sync(file_info, filename, user_id)
+            yield event.plain_result(result)
+        except Exception as e:
+            logger.error(f"【课表插件】文件处理异常: {e}")
+            yield event.plain_result(f"❌ 文件处理失败：{str(e)}")
+        finally:
+            self.processing_users.discard(user_id)
+
+    async def _process_file_sync(
+        self, file_info: dict, filename: str, user_id: str
+    ) -> str:
+        """同步处理文件，返回结果消息"""
+        file_bytes = await self.download_file_from_url(file_info.get("url"))
+        if not file_bytes:
+            return "❌ 文件下载失败，请检查网络后重试。"
+
+        if not self._is_valid_excel(file_bytes, filename):
+            return "❌ 文件不是有效的 Excel 格式，请上传 .xlsx 或 .xls 文件。"
+
+        file_id = await self.upload_file_bytes_to_coze(filename, file_bytes)
+        if not file_id:
+            return "❌ 文件上传到 Coze 失败，请稍后重试。"
+
+        success, message = await self.call_upload_workflow_with_result(file_id, user_id)
+        if success:
+            course_count = "多"
+            if message and "解析到" in message:
+                match = re.search(r"解析到\s*(\d+)\s*门", message)
+                if match:
+                    course_count = match.group(1)
+            return f"✅ 课表录入成功！共解析到 {course_count} 门课程。你可以使用 /kebiao 9 查看指定周次的课表。"
+        else:
+            return (
+                f"❌ 课表录入失败：{message or '未知错误'}，请检查文件格式或稍后重试。"
+            )
+
+    def _is_valid_excel(self, data: bytes, filename: str) -> bool:
+        if filename.lower().endswith(".xlsx"):
+            return data.startswith(b"PK\x03\x04")
+        elif filename.lower().endswith(".xls"):
+            return data.startswith(b"\xd0\xcf\x11\xe0")
+        return True
+
+    async def download_file_from_url(self, url: str) -> bytes | None:
+        if not url:
+            return None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        logger.info(
+                            f"【课表插件】文件下载成功，大小: {len(data)} bytes"
+                        )
+                        return data
+                    else:
+                        logger.error(f"【课表插件】下载失败，HTTP {resp.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"【课表插件】下载异常: {e}")
+            return None
+
+    async def upload_file_bytes_to_coze(
+        self, filename: str, file_bytes: bytes
+    ) -> str | None:
+        headers = {"Authorization": f"Bearer {self.coze_api_key}"}
+        form = aiohttp.FormData()
+        form.add_field(
+            "file",
+            file_bytes,
+            filename=filename,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        try:
+            async with self._get_client_session(host=COZE_HOST) as session:
+                async with session.post(
+                    self.file_upload_url, headers=headers, data=form, timeout=60
+                ) as resp:
+                    data = await resp.json()
+                    logger.info(f"[Coze 文件上传响应] {data}")
+                    if data.get("code") == 0:
+                        return data.get("data", {}).get("id")
+                    else:
+                        logger.error(f"[Coze 文件上传失败] {data.get('msg')}")
+                        return None
+        except Exception as e:
+            logger.error(f"[Coze 文件上传异常] {e}")
+            return None
+
+    async def call_upload_workflow_with_result(
+        self, file_id: str, user_id: str
+    ) -> tuple[bool, str]:
+        headers = {
+            "Authorization": f"Bearer {self.coze_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "workflow_id": self.upload_workflow_id,
+            "parameters": {"input": {"file_id": file_id}, "user_id": user_id},
+        }
+        logger.info(f"[Coze 入库工作流请求] {json.dumps(payload, ensure_ascii=False)}")
+        try:
+            async with self._get_client_session(host=COZE_HOST) as session:
+                async with session.post(
+                    self.coze_api_url, headers=headers, json=payload, timeout=120
+                ) as resp:
+                    data = await resp.json()
+                    logger.info(f"[Coze 入库工作流响应] {data}")
+                    if data.get("code") == 0:
+                        raw_data = data.get("data")
+                        if isinstance(raw_data, str):
+                            inner = json.loads(raw_data)
+                        else:
+                            inner = raw_data
+                        msg = inner.get("data", "录入完成") if inner else "录入完成"
+                        return True, msg
+                    else:
+                        return False, data.get("msg", "未知错误")
+        except asyncio.TimeoutError:
+            logger.error("[Coze 入库工作流] 请求超时")
+            return False, "请求超时，请稍后重试"
+        except aiohttp.ClientError as e:
+            logger.error(f"[Coze 入库工作流] 网络错误: {e}")
+            return False, f"网络错误：{e}"
+        except Exception as e:
+            logger.error(f"[Coze 入库工作流] 未知异常: {type(e).__name__} - {e}")
+            return False, f"未知异常：{e}"
+
+    # ========== /kebiao 指令处理 ==========
+    @filter.command("kebiao")
+    async def get_kebiao(self, event: AstrMessageEvent, week: str = None):
+        if not week:
+            yield event.plain_result("请指定周次，例如 /kebiao 9")
+            return
+
+        user_id = event.get_sender_id()
+        try:
+            image_url = await self.call_coze_workflow(week, user_id)
+            if not image_url:
+                yield event.plain_result("❌ 课表生成失败：工作流未返回图片链接")
+                return
+
+            logger.info(f"【课表插件】使用 curl_cffi 下载图片: {image_url[:100]}...")
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: curl_requests.get(
+                    image_url, impersonate="chrome120", timeout=15
+                ),
+            )
+            if response.status_code != 200:
+                yield event.plain_result(
+                    f"❌ 图片下载失败，HTTP {response.status_code}"
+                )
+                return
+            img_bytes = response.content
+
+            chain = [
+                Comp.Plain(f"📸 第{week}周课表"),
+                Comp.Image.fromBytes(img_bytes),
+            ]
+            yield event.chain_result(chain)
+
+        except Exception as e:
+            logger.error(f"【课表插件】图片下载或发送失败: {e}")
+            yield event.plain_result(f"❌ 图片生成失败：{str(e)}")
+
+    async def call_coze_workflow(self, week: str, user_id: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.coze_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "workflow_id": self.coze_workflow_id,
+            "parameters": {"target_week": week, "user_id": user_id},
+        }
+        try:
+            async with self._get_client_session(host=COZE_HOST) as session:
+                async with session.post(
+                    self.coze_api_url, headers=headers, json=payload, timeout=30
+                ) as resp:
+                    data = await resp.json()
+                    logger.info(f"[Coze 图片工作流响应] {data}")
+                    if data.get("code") == 0:
+                        raw_data = data.get("data")
+                        inner = (
+                            json.loads(raw_data)
+                            if isinstance(raw_data, str)
+                            else raw_data
+                        )
+                        image_url = inner.get("output")
+                        if not image_url:
+                            raise Exception("工作流未返回 output 字段")
+                        return image_url
+                    else:
+                        raise Exception(f"Coze 工作流失败: {data.get('msg')}")
+        except Exception as e:
+            logger.error(f"[Coze 图片工作流异常] {e}")
+            raise
+
+    @filter.command("upload_kebiao")
+    async def upload_kebiao(self, event: AstrMessageEvent):
+        yield event.plain_result(
+            "直接发送课表 Excel 文件给我，我会自动处理哦！无需使用此指令。"
+        )

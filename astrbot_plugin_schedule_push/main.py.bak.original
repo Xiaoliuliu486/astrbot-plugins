@@ -1,0 +1,350 @@
+import asyncio
+import datetime
+import json
+import os
+import ssl
+import traceback
+
+import aiohttp
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+import astrbot.api.message_components as Comp
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, register
+
+PLUGIN_VERSION = "1.0.7"
+logger.info(f"【推送插件】正在加载版本 {PLUGIN_VERSION}")
+
+PUSH_TIMES = {
+    "07:30": 0,
+    "09:35": 2,
+    "11:40": 4,
+    "15:35": 6,
+    "17:40": 8,
+    "20:35": 10,
+    "22:15": 12,
+}
+
+PERIOD_TO_TIME = {
+    1: "08:00-08:45",
+    2: "08:50-09:35",
+    3: "10:05-10:50",
+    4: "10:55-11:40",
+    5: "14:00-14:45",
+    6: "14:50-15:35",
+    7: "16:05-16:50",
+    8: "16:55-17:40",
+    9: "19:00-19:45",
+    10: "19:50-20:35",
+    11: "20:40-21:25",
+    12: "21:30-22:15",
+}
+
+
+@register(
+    "astrbot_plugin_schedule_push", "YourName", "课表定时推送插件", PLUGIN_VERSION
+)
+class SchedulePushPlugin(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self.version = PLUGIN_VERSION
+        self.coze_api_key = (
+            "pat_KnetZG3d6cEN18upxqih4WBFKjzAsFbM1jEK9BZXDlajwTUlHfvwg8ByNY3CN4ux"
+        )
+        self.workflow_id_get_next_class = "7631786424589910026"
+        self.workflow_id_get_subscribed_users = "7631784958214783010"
+        self.user_origins = {}
+        self.user_origins_file = os.path.join(
+            os.path.dirname(__file__), "user_origins.json"
+        )
+        self.semester_start = datetime.date(2026, 3, 2)
+        self.scheduler = AsyncIOScheduler()
+        for time_str in PUSH_TIMES:
+            hour, minute = map(int, time_str.split(":"))
+            self.scheduler.add_job(
+                self._push_next_class,
+                CronTrigger(hour=hour, minute=minute),
+                id=f"push_{time_str}",
+                replace_existing=True,
+            )
+        self.scheduler.start()
+        self._load_user_origins()
+        asyncio.create_task(self._sync_subscribed_users())
+        logger.info(
+            f"【推送插件】v{PLUGIN_VERSION} 已启动，已加载 {len(self.user_origins)} 个用户"
+        )
+
+    async def terminate(self):
+        if self.scheduler:
+            self.scheduler.shutdown(wait=False)
+            logger.info("【推送插件】调度器已关闭")
+
+    def _get_ssl_connector(self):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return aiohttp.TCPConnector(ssl=ctx)
+
+    def _load_user_origins(self):
+        try:
+            if os.path.exists(self.user_origins_file):
+                with open(self.user_origins_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.user_origins.update(data)
+                logger.info(f"【推送插件】从文件加载了 {len(data)} 个用户 origins")
+        except Exception as e:
+            logger.error(f"【推送插件】加载用户文件失败: {e}")
+
+    def _save_user_origins(self):
+        try:
+            with open(self.user_origins_file, "w", encoding="utf-8") as f:
+                json.dump(self.user_origins, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"【推送插件】保存用户文件失败: {e}")
+
+    async def _sync_subscribed_users(self):
+        """从 Coze 数据库获取已订阅用户列表（用于日志核对）"""
+        headers = {
+            "Authorization": f"Bearer {self.coze_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "workflow_id": self.workflow_id_get_subscribed_users,
+            "parameters": {},
+        }
+        try:
+            async with aiohttp.ClientSession(
+                connector=self._get_ssl_connector()
+            ) as session:
+                async with session.post(
+                    "https://113.57.56.233/v1/workflow/run",
+                    headers={"Host": "api.coze.cn", **headers},
+                    json=payload,
+                    timeout=30,
+                ) as resp:
+                    raw_text = await resp.text()
+                    data = json.loads(raw_text)
+                    logger.info(f"【推送插件】Coze 订阅用户查询响应: {data}")
+                    if data.get("code") != 0:
+                        logger.error(f"【推送插件】Coze 订阅用户查询失败: {data}")
+                        return
+                    raw = data.get("data")
+                    if isinstance(raw, str):
+                        parsed = json.loads(raw)
+                    else:
+                        parsed = raw
+                    if not isinstance(parsed, dict):
+                        return
+                    output = parsed.get("output")
+                    if isinstance(output, str):
+                        try:
+                            output = json.loads(output)
+                        except json.JSONDecodeError:
+                            pass
+                    subscribed_ids = set()
+                    if isinstance(output, list):
+                        for item in output:
+                            if isinstance(item, dict):
+                                uid = str(item.get("user_id", ""))
+                            else:
+                                uid = str(item)
+                            if uid:
+                                subscribed_ids.add(uid)
+                    elif isinstance(output, dict):
+                        uid = str(output.get("user_id", ""))
+                        if uid:
+                            subscribed_ids.add(uid)
+                    local_ids = set(self.user_origins.keys())
+                    missing = subscribed_ids - local_ids
+                    if missing:
+                        logger.info(
+                            f"【推送插件】Coze 中有 {len(missing)} 个已订阅用户尚未注册 origin: {missing}"
+                        )
+                    logger.info(
+                        f"【推送插件】Coze 已订阅 {len(subscribed_ids)} 人，本地已注册 {len(local_ids)} 人"
+                    )
+        except Exception as e:
+            logger.error(f"【推送插件】同步订阅用户异常: {e}")
+
+    async def call_coze_workflow(
+        self, workflow_id: str, parameters: dict
+    ) -> dict | None:
+        headers = {
+            "Authorization": f"Bearer {self.coze_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {"workflow_id": workflow_id, "parameters": parameters}
+        try:
+            async with aiohttp.ClientSession(
+                connector=self._get_ssl_connector()
+            ) as session:
+                async with session.post(
+                    "https://113.57.56.233/v1/workflow/run",
+                    headers={"Host": "api.coze.cn", **headers},
+                    json=payload,
+                    timeout=30,
+                ) as resp:
+                    raw_text = await resp.text()
+                    data = json.loads(raw_text)
+                    logger.info(f"【推送插件】Coze 原始响应: {data}")
+                    if data.get("code") != 0:
+                        logger.error(f"【推送插件】Coze 工作流失败: {data}")
+                        return None
+                    raw = data.get("data")
+                    if isinstance(raw, str):
+                        parsed = json.loads(raw)
+                    else:
+                        parsed = raw
+                    if not isinstance(parsed, dict):
+                        logger.error(f"【推送插件】Coze 响应 data 不是 dict: {parsed}")
+                        return None
+                    course = parsed.get("course")
+                    if isinstance(course, dict):
+                        logger.info(f"【推送插件】从 course 字段解析: {course}")
+                        return course
+                    if course is None:
+                        logger.info("【推送插件】course 为 null，无课程数据")
+                        return None
+                    output = parsed.get("output")
+                    if output:
+                        if isinstance(output, str):
+                            try:
+                                nested = json.loads(output)
+                                if isinstance(nested, dict):
+                                    logger.info(
+                                        f"【推送插件】从 output(JSON) 解析: {nested}"
+                                    )
+                                    return nested
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                            logger.info(f"【推送插件】output 为普通字符串: {output}")
+                            return {"course_name": output}
+                        if isinstance(output, dict):
+                            logger.info(f"【推送插件】从 output(dict) 解析: {output}")
+                            return output
+                    logger.info("【推送插件】未找到有效课程数据，返回 None")
+                    return None
+        except asyncio.TimeoutError:
+            logger.error("【推送插件】Coze 请求超时(30s)")
+            return None
+        except Exception as e:
+            logger.error(f"【推送插件】Coze 网络异常: {e}\n{traceback.format_exc()}")
+            return None
+
+    async def _push_next_class(self):
+        now = datetime.datetime.now()
+        minute_key = now.strftime("%Y%m%d%H%M")
+        if hasattr(self, "_last_push_minute") and self._last_push_minute == minute_key:
+            logger.info("【推送插件】本分钟已推送过，跳过重复触发")
+            return
+        self._last_push_minute = minute_key
+
+        current_period = None
+        for time_str, period_num in PUSH_TIMES.items():
+            h, m = map(int, time_str.split(":"))
+            if abs((now.hour * 60 + now.minute) - (h * 60 + m)) <= 1:
+                current_period = period_num
+                break
+        if not current_period:
+            return
+        weekday_map = {
+            0: "星期一",
+            1: "星期二",
+            2: "星期三",
+            3: "星期四",
+            4: "星期五",
+            5: "星期六",
+            6: "星期日",
+        }
+        today_weekday = weekday_map[datetime.date.today().weekday()]
+        current_week = max(
+            1, (datetime.date.today() - self.semester_start).days // 7 + 1
+        )
+        if not self.user_origins:
+            logger.info("【推送插件】没有订阅用户，跳过推送")
+            return
+        weekday_num = str(datetime.date.today().weekday() + 1)
+        for uid, origin in self.user_origins.items():
+            try:
+                params = {
+                    "user_id": str(uid),
+                    "weekday": today_weekday,
+                    "weekday_num": weekday_num,
+                    "current_week": current_week,
+                    "current_period": current_period,
+                }
+                logger.info(
+                    f"【推送插件】推送查询: uid={uid} period={current_period} 周{current_week} {today_weekday}({weekday_num})"
+                )
+                result = await self.call_coze_workflow(
+                    self.workflow_id_get_next_class, params
+                )
+                if result:
+                    time_range = PERIOD_TO_TIME.get(
+                        result.get("start_period", 0), "时间未知"
+                    )
+                    msg = (
+                        f"下一节课是 {result.get('course_name', '未知课程')}\n"
+                        f"地点：{result.get('location', '未知')}\n"
+                        f"教师：{result.get('teachers', '未知')}\n"
+                        f"时间：{time_range}\n"
+                        f"记得准时哦～"
+                    )
+                else:
+                    msg = "今天后面没有课啦，好好休息一下吧～"
+                await self.context.send_message(
+                    origin, MessageChain(chain=[Comp.Plain(msg)])
+                )
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"推送失败 {uid}: {e}")
+
+    @filter.command("test_push")
+    async def test_push(self, event: AstrMessageEvent):
+        user_id = event.get_sender_id()
+        self.user_origins[user_id] = event.unified_msg_origin
+        self._save_user_origins()
+        logger.info(f"【推送插件】已缓存用户 {user_id}")
+        yield event.plain_result(f"开始测试推送(v{PLUGIN_VERSION})...")
+        await self._push_next_class()
+        yield event.plain_result("测试完成，请检查私聊")
+
+    @filter.command("astr_schedule_test")
+    async def test_schedule_push(self, event: AstrMessageEvent):
+        user_id = event.get_sender_id()
+        self.user_origins[user_id] = event.unified_msg_origin
+        self._save_user_origins()
+        test_date = datetime.date(2026, 4, 28)
+        current_week = max(1, (test_date - self.semester_start).days // 7 + 1)
+        today_weekday = "星期二"
+        params = {
+            "user_id": str(user_id),
+            "weekday": today_weekday,
+            "weekday_num": "2",
+            "current_week": current_week,
+            "current_period": 1,
+        }
+        logger.info(
+            f"【推送插件】v{PLUGIN_VERSION} 测试: {test_date} 周{current_week} 周二 08:45后 period=1"
+        )
+        yield event.plain_result(
+            f"正在查询4月28日周二第一节课后课程(v{PLUGIN_VERSION})..."
+        )
+        result = await self.call_coze_workflow(self.workflow_id_get_next_class, params)
+        logger.info(f"【推送插件】工作流返回: {result}")
+        if result:
+            start_p = result.get("start_period", 0)
+            time_range = PERIOD_TO_TIME.get(start_p, "时间未知")
+            msg = (
+                f"4月28日周二 08:45 后的课程：\n"
+                f"课程：{result.get('course_name', '未知')}\n"
+                f"时间：{time_range}\n"
+                f"地点：{result.get('location', '未知')}\n"
+                f"教师：{result.get('teachers', '未知')}"
+            )
+            yield event.plain_result(msg)
+        else:
+            yield event.plain_result("4月28日周二第一节课后没有更多课程了")
+        yield event.plain_result("测试完成")

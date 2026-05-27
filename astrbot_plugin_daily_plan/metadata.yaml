@@ -1,0 +1,4 @@
+name: astrbot_plugin_daily_plan
+desc: 日常计划推送插件 - 08:00推送今日计划，20:00推送明日提醒
+version: 1.0.0
+author: ""

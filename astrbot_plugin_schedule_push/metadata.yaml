@@ -1,0 +1,8 @@
+name: astrbot_plugin_schedule_push
+version: "1.1.0"
+description: "课表定时推送插件，每节课下课后主动提醒用户下一节课信息"
+author: "YourName"
+tags:
+  - 课表
+  - 推送
+  - 定时任务

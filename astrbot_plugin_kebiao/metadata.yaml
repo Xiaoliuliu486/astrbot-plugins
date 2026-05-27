@@ -1,0 +1,7 @@
+name: astrbot_plugin_kebiao
+version: "1.0.47"
+description: "课表图片生成插件，调用 Coze 工作流并发送图片"
+author: "YourName"
+tags:
+  - 课表
+  - 工具
